@@ -35,3 +35,17 @@ Available scripts:
 cd hurrican_omarchy_enabling/mipi-camera-ptl/build-from-source
 sudo ./mipi_install_omarchy_6196.sh
 ```
+
+### openvino-install-scripts/
+
+Automated installation of Intel OpenVINO with CPU, GPU, and NPU support.
+See [openvino-install-scripts/README.md](openvino-install-scripts/README.md) for full details.
+
+Available scripts:
+- `install-openvino` — Omarchy / Arch Linux (pacman + AUR)
+- `install-openvino-ubuntu` — Ubuntu 24.04 (apt + PPA)
+
+```bash
+cd hurrican_omarchy_enabling/openvino-install-scripts
+./install-openvino
+```

@@ -1,0 +1,768 @@
+#!/bin/bash
+#
+# OpenVINO Installation Script for Ubuntu
+#
+# Installs Intel OpenVINO with CPU, GPU, and NPU support on Ubuntu systems.
+# Tested on: Ubuntu 24.04+ on Hurrican/Performance with Arc GPU and NPU
+#
+# Usage: install-openvino-ubuntu [OPTIONS]
+#
+# Options:
+#   -h, --help          Show this help message
+#   -y, --yes           Non-interactive mode (assume yes to all prompts)
+#   -v, --venv PATH     Custom virtual environment path (default: ~/openvino-env)
+#   --skip-npu          Skip NPU driver installation
+#   --skip-gpu          Skip GPU driver installation
+#   --uninstall         Remove OpenVINO installation
+#   --verify            Only run verification (check existing installation)
+#
+
+set -euo pipefail
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+SCRIPT_VERSION="1.0.0"
+DEFAULT_VENV_PATH="$HOME/openvino-env"
+VENV_PATH="$DEFAULT_VENV_PATH"
+LOG_FILE="/tmp/openvino-install-$(date +%Y%m%d-%H%M%S).log"
+
+# Intel NPU driver (distributed as .deb via GitHub releases)
+INTEL_NPU_DRIVER_REPO="https://github.com/intel/linux-npu-driver"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# Options
+NON_INTERACTIVE=false
+SKIP_NPU=false
+SKIP_GPU=false
+UNINSTALL=false
+VERIFY_ONLY=false
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+info() {
+    echo -e "${BLUE}[INFO]${NC} $*"
+    log "INFO: $*"
+}
+
+success() {
+    echo -e "${GREEN}[OK]${NC} $*"
+    log "SUCCESS: $*"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*"
+    log "WARN: $*"
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+    log "ERROR: $*"
+}
+
+fatal() {
+    error "$*"
+    echo -e "${RED}Installation failed. Check log: $LOG_FILE${NC}" >&2
+    exit 1
+}
+
+header() {
+    echo ""
+    echo -e "${BOLD}=== $* ===${NC}"
+    echo ""
+    log "=== $* ==="
+}
+
+confirm() {
+    if $NON_INTERACTIVE; then
+        return 0
+    fi
+
+    local prompt="${1:-Continue?}"
+    echo -n -e "${YELLOW}$prompt [y/N]: ${NC}"
+    read -r response
+    case "$response" in
+        [yY][eE][sS]|[yY]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+check_command() {
+    command -v "$1" &> /dev/null
+}
+
+check_package() {
+    dpkg -l "$1" 2>/dev/null | grep -q "^ii"
+}
+
+get_ubuntu_version() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        echo "$VERSION_ID"
+    else
+        echo ""
+    fi
+}
+
+get_ubuntu_codename() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        echo "$VERSION_CODENAME"
+    else
+        echo ""
+    fi
+}
+
+# ============================================================================
+# Prerequisite Checks
+# ============================================================================
+
+check_prerequisites() {
+    header "Checking Prerequisites"
+
+    # Check if running on Ubuntu
+    if [[ ! -f /etc/os-release ]] || ! grep -qi "ubuntu" /etc/os-release; then
+        fatal "This script is designed for Ubuntu systems"
+    fi
+
+    local ubuntu_version
+    ubuntu_version=$(get_ubuntu_version)
+    success "Ubuntu $ubuntu_version detected"
+
+    # Check for sudo access
+    if ! sudo -v &> /dev/null; then
+        fatal "This script requires sudo access"
+    fi
+    success "Sudo access confirmed"
+
+    # Check for internet connectivity using multiple methods
+    if wget -q --spider --timeout=10 https://pypi.org/ 2>/dev/null; then
+        success "Internet connectivity confirmed"
+    elif python3 -c "import urllib.request; urllib.request.urlopen('https://pypi.org/', timeout=10)" 2>/dev/null; then
+        success "Internet connectivity confirmed"
+    elif curl -sfSL --max-time 10 -o /dev/null https://pypi.org/ 2>/dev/null; then
+        success "Internet connectivity confirmed"
+    else
+        warn "Cannot reach pypi.org - check internet connectivity"
+        if ! confirm "Continue anyway?"; then
+            exit 1
+        fi
+    fi
+
+    # Check for required commands
+    for cmd in git curl; do
+        if ! check_command "$cmd"; then
+            info "Installing missing command: $cmd"
+            sudo apt-get install -y "$cmd" >> "$LOG_FILE" 2>&1 || fatal "Failed to install $cmd"
+        fi
+    done
+    success "Required commands available"
+
+    # Ensure python3 is installed
+    if ! check_command python3; then
+        info "Installing Python3..."
+        sudo apt-get install -y python3 >> "$LOG_FILE" 2>&1 || fatal "Failed to install python3"
+    fi
+
+    # Check Python version
+    local py_version
+    py_version=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    if python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)"; then
+        success "Python $py_version detected"
+    else
+        fatal "Python 3.9 or later required (found: $py_version)"
+    fi
+}
+
+# ============================================================================
+# Intel APT Repository Setup
+# ============================================================================
+
+setup_intel_gpu_repo() {
+    header "Setting Up Intel GPU PPA"
+
+    # Install prerequisites
+    info "Installing prerequisites..."
+    sudo apt-get install -y software-properties-common >> "$LOG_FILE" 2>&1
+
+    # Add the kobuk-team Intel graphics PPA (official Intel GPU compute packages for Ubuntu)
+    if ! grep -rq "kobuk-team/intel-graphics" /etc/apt/sources.list.d/ 2>/dev/null; then
+        info "Adding Intel Graphics PPA (kobuk-team/intel-graphics)..."
+        if sudo add-apt-repository -y ppa:kobuk-team/intel-graphics >> "$LOG_FILE" 2>&1; then
+            success "Intel Graphics PPA added"
+        else
+            warn "Failed to add Intel Graphics PPA"
+            return 1
+        fi
+    else
+        success "Intel Graphics PPA already configured"
+    fi
+
+    info "Updating package lists..."
+    sudo apt-get update >> "$LOG_FILE" 2>&1
+    success "Package lists updated"
+}
+
+fetch_latest_npu_release_url() {
+    # Get the latest release .deb tarball URL from GitHub API
+    local api_url="https://api.github.com/repos/intel/linux-npu-driver/releases/latest"
+    local asset_url
+
+    asset_url=$(curl -fsSL "$api_url" 2>/dev/null | \
+        python3 -c "
+import json, sys, re
+data = json.load(sys.stdin)
+for asset in data.get('assets', []):
+    name = asset.get('name', '')
+    if 'ubuntu' in name.lower() and name.endswith('.tar.gz'):
+        print(asset['browser_download_url'])
+        sys.exit(0)
+# Fallback: any .deb tarball
+for asset in data.get('assets', []):
+    name = asset.get('name', '')
+    if name.endswith('.tar.gz') and 'deb' in name.lower():
+        print(asset['browser_download_url'])
+        sys.exit(0)
+print('')
+" 2>/dev/null)
+
+    echo "$asset_url"
+}
+
+# ============================================================================
+# Installation Functions
+# ============================================================================
+
+install_base_packages() {
+    header "Phase 1: Installing Base Packages"
+
+    local packages=(python3-pip python3-venv python3-dev)
+
+    info "Installing: ${packages[*]}"
+    if sudo apt-get install -y "${packages[@]}" >> "$LOG_FILE" 2>&1; then
+        success "Base packages installed"
+    else
+        fatal "Failed to install base packages"
+    fi
+
+    if ! $SKIP_GPU; then
+        setup_intel_gpu_repo
+
+        local gpu_packages=(libze-intel-gpu1 libze1 intel-opencl-icd intel-metrics-discovery libigsc0 clinfo)
+
+        info "Installing GPU compute packages: ${gpu_packages[*]}"
+        if sudo apt-get install -y "${gpu_packages[@]}" >> "$LOG_FILE" 2>&1; then
+            success "GPU compute packages installed"
+        else
+            warn "Some GPU packages failed to install - trying individually..."
+            for pkg in "${gpu_packages[@]}"; do
+                if sudo apt-get install -y "$pkg" >> "$LOG_FILE" 2>&1; then
+                    success "Installed $pkg"
+                else
+                    warn "Failed to install $pkg (non-fatal)"
+                fi
+            done
+        fi
+    fi
+}
+
+setup_virtual_environment() {
+    header "Phase 2: Setting Up Python Virtual Environment"
+
+    if [[ -d "$VENV_PATH" ]]; then
+        warn "Virtual environment already exists at $VENV_PATH"
+        if confirm "Remove and recreate?"; then
+            rm -rf "$VENV_PATH"
+        else
+            info "Using existing virtual environment"
+            return 0
+        fi
+    fi
+
+    info "Creating virtual environment at $VENV_PATH"
+    if python3 -m venv "$VENV_PATH" >> "$LOG_FILE" 2>&1; then
+        success "Virtual environment created"
+    else
+        fatal "Failed to create virtual environment"
+    fi
+
+    # Activate and upgrade pip
+    # shellcheck source=/dev/null
+    source "$VENV_PATH/bin/activate"
+
+    info "Upgrading pip..."
+    if pip install --upgrade pip >> "$LOG_FILE" 2>&1; then
+        success "pip upgraded"
+    else
+        warn "pip upgrade failed (non-fatal)"
+    fi
+}
+
+install_openvino() {
+    header "Phase 3: Installing OpenVINO"
+
+    # Ensure virtual environment is activated
+    # shellcheck source=/dev/null
+    source "$VENV_PATH/bin/activate"
+
+    # Check if already installed
+    if pip show openvino &> /dev/null; then
+        local current_version
+        current_version=$(pip show openvino | grep Version | cut -d' ' -f2)
+        warn "OpenVINO $current_version already installed"
+        if ! confirm "Reinstall/upgrade?"; then
+            return 0
+        fi
+    fi
+
+    info "Installing OpenVINO via pip..."
+    if pip install --upgrade openvino >> "$LOG_FILE" 2>&1; then
+        local installed_version
+        installed_version=$(pip show openvino | grep Version | cut -d' ' -f2)
+        success "OpenVINO $installed_version installed"
+    else
+        fatal "Failed to install OpenVINO"
+    fi
+}
+
+install_npu_driver() {
+    if $SKIP_NPU; then
+        info "Skipping NPU driver installation (--skip-npu)"
+        return 0
+    fi
+
+    header "Phase 4: Installing Intel NPU Driver"
+
+    # Check if already installed
+    if check_package intel-driver-compiler-npu; then
+        local current_version
+        current_version=$(dpkg -l intel-driver-compiler-npu 2>/dev/null | grep "^ii" | awk '{print $3}' || echo "unknown")
+        warn "Intel NPU driver $current_version already installed"
+        if ! confirm "Reinstall?"; then
+            return 0
+        fi
+    fi
+
+    # Download .deb packages from GitHub releases
+    info "Fetching latest NPU driver release from GitHub..."
+    local download_url
+    download_url=$(fetch_latest_npu_release_url)
+
+    if [[ -z "$download_url" ]]; then
+        warn "Could not determine latest NPU driver release URL"
+        info "You can install manually from: $INTEL_NPU_DRIVER_REPO/releases"
+        if confirm "Continue without NPU driver?"; then
+            return 0
+        else
+            fatal "NPU driver installation failed"
+        fi
+    fi
+
+    local build_dir="/tmp/intel-npu-driver-install-$$"
+    mkdir -p "$build_dir"
+
+    info "Downloading NPU driver from: $download_url"
+    if curl -fSL -o "$build_dir/npu-driver.tar.gz" "$download_url" >> "$LOG_FILE" 2>&1; then
+        success "NPU driver downloaded"
+    else
+        fatal "Failed to download NPU driver"
+    fi
+
+    info "Extracting packages..."
+    if tar -xzf "$build_dir/npu-driver.tar.gz" -C "$build_dir" >> "$LOG_FILE" 2>&1; then
+        success "Packages extracted"
+    else
+        fatal "Failed to extract NPU driver archive"
+    fi
+
+    # Install dependency: libtbb12
+    info "Installing dependencies..."
+    sudo apt-get install -y libtbb12 >> "$LOG_FILE" 2>&1 || true
+
+    info "Installing NPU driver .deb packages..."
+    local deb_files
+    deb_files=$(find "$build_dir" -name "*.deb" 2>/dev/null)
+
+    if [[ -z "$deb_files" ]]; then
+        fatal "No .deb files found in downloaded archive"
+    fi
+
+    if sudo dpkg -i "$build_dir"/*.deb >> "$LOG_FILE" 2>&1; then
+        success "NPU driver packages installed"
+    else
+        info "Resolving dependencies..."
+        if sudo apt-get install -f -y >> "$LOG_FILE" 2>&1; then
+            success "NPU driver installed (dependencies resolved)"
+        else
+            fatal "Failed to install NPU driver packages"
+        fi
+    fi
+
+    # Cleanup
+    rm -rf "$build_dir"
+}
+
+configure_kernel_module() {
+    if $SKIP_NPU; then
+        return 0
+    fi
+
+    header "Phase 5: Configuring NPU Kernel Module"
+
+    # Load module immediately
+    if lsmod | grep -q intel_vpu; then
+        success "intel_vpu module already loaded"
+    else
+        info "Loading intel_vpu kernel module..."
+        if sudo modprobe intel_vpu 2>> "$LOG_FILE"; then
+            success "intel_vpu module loaded"
+        else
+            warn "Failed to load intel_vpu module (may require reboot or newer kernel)"
+        fi
+    fi
+
+    # Make persistent
+    local conf_file="/etc/modules-load.d/intel-npu.conf"
+    if [[ -f "$conf_file" ]] && grep -q "intel_vpu" "$conf_file"; then
+        success "Module persistence already configured"
+    else
+        info "Configuring module to load at boot..."
+        echo "intel_vpu" | sudo tee "$conf_file" > /dev/null
+        success "Module persistence configured"
+    fi
+
+    # Check for device node
+    if [[ -e /dev/accel/accel0 ]]; then
+        success "NPU device detected at /dev/accel/accel0"
+    else
+        warn "NPU device not found - may require reboot"
+    fi
+}
+
+configure_user_permissions() {
+    header "Phase 6: Configuring User Permissions"
+
+    local groups_to_add=()
+    local current_groups
+    current_groups=$(groups "$USER")
+
+    if ! echo "$current_groups" | grep -qw "render"; then
+        groups_to_add+=(render)
+    fi
+
+    if ! echo "$current_groups" | grep -qw "video"; then
+        groups_to_add+=(video)
+    fi
+
+    if [[ ${#groups_to_add[@]} -eq 0 ]]; then
+        success "User already in required groups (render, video)"
+        return 0
+    fi
+
+    info "Adding user to groups: ${groups_to_add[*]}"
+    for group in "${groups_to_add[@]}"; do
+        if sudo usermod -aG "$group" "$USER" 2>> "$LOG_FILE"; then
+            success "Added to $group group"
+        else
+            warn "Failed to add to $group group"
+        fi
+    done
+
+    warn "You must logout and login again for group changes to take effect"
+}
+
+# ============================================================================
+# Verification
+# ============================================================================
+
+verify_installation() {
+    header "Verifying Installation"
+
+    if [[ ! -d "$VENV_PATH" ]]; then
+        error "Virtual environment not found at $VENV_PATH"
+        return 1
+    fi
+
+    # shellcheck source=/dev/null
+    source "$VENV_PATH/bin/activate"
+
+    if ! pip show openvino &> /dev/null; then
+        error "OpenVINO not installed in virtual environment"
+        return 1
+    fi
+
+    info "Running device detection..."
+    echo ""
+
+    python3 << 'PYEOF'
+import sys
+try:
+    from openvino import Core
+
+    core = Core()
+    devices = core.available_devices
+
+    print("=" * 50)
+    print("OpenVINO Device Detection Results")
+    print("=" * 50)
+
+    # Get version
+    try:
+        version = core.get_versions('CPU')['CPU'].build_number
+        print(f"OpenVINO Version: {version}")
+    except:
+        print("OpenVINO Version: (unable to detect)")
+
+    print()
+
+    if not devices:
+        print("WARNING: No devices detected!")
+        sys.exit(1)
+
+    device_status = {"CPU": False, "GPU": False, "NPU": False}
+
+    for device in devices:
+        try:
+            name = core.get_property(device, "FULL_DEVICE_NAME")
+        except:
+            name = "(name unavailable)"
+
+        print(f"  [OK] {device}: {name}")
+
+        if device.startswith("CPU"):
+            device_status["CPU"] = True
+        elif device.startswith("GPU"):
+            device_status["GPU"] = True
+        elif device.startswith("NPU"):
+            device_status["NPU"] = True
+
+    print()
+    print("=" * 50)
+    print("Summary:")
+    for dev, found in device_status.items():
+        status = "Available" if found else "Not detected"
+        symbol = "[OK]" if found else "[--]"
+        print(f"  {symbol} {dev}: {status}")
+    print("=" * 50)
+
+except ImportError as e:
+    print(f"ERROR: Failed to import OpenVINO: {e}")
+    sys.exit(1)
+except Exception as e:
+    print(f"ERROR: {e}")
+    sys.exit(1)
+PYEOF
+
+    local exit_code=$?
+    echo ""
+
+    if [[ $exit_code -eq 0 ]]; then
+        success "Verification completed"
+    else
+        error "Verification failed"
+    fi
+
+    return $exit_code
+}
+
+# ============================================================================
+# Uninstallation
+# ============================================================================
+
+uninstall() {
+    header "Uninstalling OpenVINO"
+
+    if ! confirm "This will remove the OpenVINO virtual environment and NPU driver. Continue?"; then
+        info "Uninstall cancelled"
+        exit 0
+    fi
+
+    # Remove virtual environment
+    if [[ -d "$VENV_PATH" ]]; then
+        info "Removing virtual environment at $VENV_PATH"
+        rm -rf "$VENV_PATH"
+        success "Virtual environment removed"
+    else
+        info "Virtual environment not found"
+    fi
+
+    # Remove NPU driver packages
+    local npu_packages=(intel-driver-compiler-npu intel-fw-npu intel-level-zero-npu intel-npu-driver)
+    for pkg in "${npu_packages[@]}"; do
+        if check_package "$pkg"; then
+            info "Removing $pkg..."
+            if sudo apt-get remove -y "$pkg" >> "$LOG_FILE" 2>&1; then
+                success "$pkg removed"
+            else
+                warn "Failed to remove $pkg"
+            fi
+        fi
+    done
+
+    # Remove module config
+    if [[ -f /etc/modules-load.d/intel-npu.conf ]]; then
+        sudo rm -f /etc/modules-load.d/intel-npu.conf
+        success "Module configuration removed"
+    fi
+
+    success "Uninstallation complete"
+    info "Note: Base packages (intel-opencl-icd, etc.) and Intel Graphics PPA were not removed"
+    info "To remove Intel Graphics PPA: sudo add-apt-repository --remove ppa:kobuk-team/intel-graphics"
+}
+
+# ============================================================================
+# Usage and Main
+# ============================================================================
+
+show_help() {
+    cat << EOF
+OpenVINO Installation Script for Ubuntu v$SCRIPT_VERSION
+
+Usage: $(basename "$0") [OPTIONS]
+
+Options:
+  -h, --help          Show this help message
+  -y, --yes           Non-interactive mode (assume yes to all prompts)
+  -v, --venv PATH     Custom virtual environment path (default: ~/openvino-env)
+  --skip-npu          Skip NPU driver installation
+  --skip-gpu          Skip GPU driver installation
+  --uninstall         Remove OpenVINO installation
+  --verify            Only run verification (check existing installation)
+
+Examples:
+  $(basename "$0")                    # Interactive installation
+  $(basename "$0") -y                 # Non-interactive installation
+  $(basename "$0") -v ~/my-venv       # Custom venv path
+  $(basename "$0") --verify           # Check existing installation
+  $(basename "$0") --uninstall        # Remove installation
+
+After installation:
+  source ~/openvino-env/bin/activate
+  python3 -c "from openvino import Core; print(Core().available_devices)"
+
+EOF
+}
+
+main() {
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -y|--yes)
+                NON_INTERACTIVE=true
+                shift
+                ;;
+            -v|--venv)
+                VENV_PATH="$2"
+                shift 2
+                ;;
+            --skip-npu)
+                SKIP_NPU=true
+                shift
+                ;;
+            --skip-gpu)
+                SKIP_GPU=true
+                shift
+                ;;
+            --uninstall)
+                UNINSTALL=true
+                shift
+                ;;
+            --verify)
+                VERIFY_ONLY=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+
+    # Expand ~ in VENV_PATH
+    VENV_PATH="${VENV_PATH/#\~/$HOME}"
+
+    echo ""
+    echo -e "${BOLD}OpenVINO Installation Script for Ubuntu${NC}"
+    echo -e "Version: $SCRIPT_VERSION"
+    echo -e "Log file: $LOG_FILE"
+    echo ""
+
+    log "Script started with options: NON_INTERACTIVE=$NON_INTERACTIVE SKIP_NPU=$SKIP_NPU SKIP_GPU=$SKIP_GPU"
+    log "VENV_PATH=$VENV_PATH"
+
+    if $VERIFY_ONLY; then
+        verify_installation
+        exit $?
+    fi
+
+    if $UNINSTALL; then
+        uninstall
+        exit 0
+    fi
+
+    # Show installation summary
+    echo "Installation Summary:"
+    echo "  - Virtual environment: $VENV_PATH"
+    echo "  - GPU support: $( $SKIP_GPU && echo 'Skip' || echo 'Install' )"
+    echo "  - NPU support: $( $SKIP_NPU && echo 'Skip' || echo 'Install' )"
+    echo ""
+
+    if ! confirm "Proceed with installation?"; then
+        info "Installation cancelled"
+        exit 0
+    fi
+
+    # Run installation phases
+    check_prerequisites
+    install_base_packages
+    setup_virtual_environment
+    install_openvino
+    install_npu_driver
+    configure_kernel_module
+    configure_user_permissions
+
+    # Final verification
+    echo ""
+    if confirm "Run verification now?"; then
+        verify_installation
+    fi
+
+    header "Installation Complete"
+
+    echo -e "${GREEN}OpenVINO has been successfully installed!${NC}"
+    echo ""
+    echo "To use OpenVINO:"
+    echo "  source $VENV_PATH/bin/activate"
+    echo "  python3 -c \"from openvino import Core; print(Core().available_devices)\""
+    echo ""
+
+    if ! groups | grep -qw render; then
+        echo -e "${YELLOW}IMPORTANT: Logout and login again for device access permissions.${NC}"
+        echo ""
+    fi
+
+    echo "Log file: $LOG_FILE"
+    echo ""
+}
+
+# Run main function
+main "$@"
