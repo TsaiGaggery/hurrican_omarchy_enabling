@@ -1,0 +1,175 @@
+From 231528672f45a0a31d4b0d9030d718408123a9ae Mon Sep 17 00:00:00 2001
+From: Intel <intel@local>
+Date: Tue, 3 Mar 2026 15:30:24 -0800
+Subject: [PATCH 2/2] staging: ipu7: PSYS/ISYS ABI workaround for runtime PM
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The running kernel binary's struct auxiliary_driver does NOT have the
+resume field, even though the source defines it. This causes an 8-byte
+offset mismatch — driver.pm ends up at the wrong struct offset and
+runtime PM callbacks (resume/suspend) never fire.
+
+Without runtime PM, PSYS firmware never boots on device open and ISYS
+hardware never initializes, so the camera doesn't work.
+
+Fix: remove the resume field from auxiliary_bus.h to match the binary
+ABI, and add explicit hardware init/cleanup in the open/release paths
+of both PSYS and ISYS instead of relying on runtime PM.
+
+Files changed:
+- include/linux/auxiliary_bus.h: remove resume field
+- drivers/staging/media/ipu7/psys/ipu-psys.c: explicit FW boot in
+  ipu7_psys_open(), explicit cleanup in ipu7_psys_release()
+- drivers/staging/media/ipu7/ipu7-isys-video.c: explicit hw init in
+  ipu7_isys_fw_open(), explicit cleanup in ipu7_isys_fw_close()
+---
+ drivers/staging/media/ipu7/ipu7-isys-video.c | 40 ++++++++++++++++++-
+ drivers/staging/media/ipu7/psys/ipu-psys.c   | 42 ++++++++++++++++++++
+ include/linux/auxiliary_bus.h                |  2 -
+ 3 files changed, 81 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/staging/media/ipu7/ipu7-isys-video.c b/drivers/staging/media/ipu7/ipu7-isys-video.c
+index 8c6730833..c8d85f24e 100644
+--- a/drivers/staging/media/ipu7/ipu7-isys-video.c
++++ b/drivers/staging/media/ipu7/ipu7-isys-video.c
+@@ -875,6 +875,29 @@ int ipu7_isys_fw_open(struct ipu7_isys *isys)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/* Workaround: init hardware if runtime PM resume did not fire */
++	if (!isys->power) {
++		unsigned long wk_flags;
++
++		dev_info(&adev->auxdev.dev,
++			 "ISYS power not ready, initializing explicitly\n");
++		ret = ipu7_mmu_hw_init(adev->mmu);
++		if (ret) {
++			dev_err(&adev->auxdev.dev,
++				"MMU hw init failed: %d\n", ret);
++			pm_runtime_put(&adev->auxdev.dev);
++			return ret;
++		}
++		cpu_latency_qos_update_request(&isys->pm_qos, 300);
++		ret = ipu_buttress_start_tsc_sync(adev->isp);
++		if (ret)
++			dev_warn(&adev->auxdev.dev,
++				 "TSC sync failed: %d\n", ret);
++		spin_lock_irqsave(&isys->power_lock, wk_flags);
++		isys->power = 1;
++		spin_unlock_irqrestore(&isys->power_lock, wk_flags);
++	}
++
+ 	mutex_lock(&isys->mutex);
+ 
+ 	if (isys->ref_count++)
+@@ -908,9 +931,24 @@ void ipu7_isys_fw_close(struct ipu7_isys *isys)
+ 
+ 	isys->ref_count--;
+ 
+-	if (!isys->ref_count)
++	if (!isys->ref_count) {
+ 		ipu7_fw_isys_close(isys);
+ 
++		/* Workaround: clean up hw since runtime PM suspend won't fire */
++		if (isys->power) {
++			unsigned long wk_flags;
++
++			dev_info(&isys->adev->auxdev.dev,
++				 "ISYS cleaning up hw (suspend workaround)\n");
++			spin_lock_irqsave(&isys->power_lock, wk_flags);
++			isys->power = 0;
++			spin_unlock_irqrestore(&isys->power_lock, wk_flags);
++			cpu_latency_qos_update_request(&isys->pm_qos,
++						       PM_QOS_DEFAULT_VALUE);
++			ipu7_mmu_hw_cleanup(isys->adev->mmu);
++		}
++	}
++
+ 	mutex_unlock(&isys->mutex);
+ 	pm_runtime_put(&isys->adev->auxdev.dev);
+ }
+diff --git a/drivers/staging/media/ipu7/psys/ipu-psys.c b/drivers/staging/media/ipu7/psys/ipu-psys.c
+index 838f0b268..d412013f7 100644
+--- a/drivers/staging/media/ipu7/psys/ipu-psys.c
++++ b/drivers/staging/media/ipu7/psys/ipu-psys.c
+@@ -460,6 +460,33 @@ static int ipu7_psys_open(struct inode *inode, struct file *file)
+ 		goto rpm_put;
+ 	}
+ 
++	/* Workaround: boot firmware if runtime PM resume did not fire */
++	if (!psys->ready) {
++		unsigned long wk_flags;
++
++		dev_info(dev, "PSYS fw not ready, booting explicitly\n");
++		ret = ipu7_mmu_hw_init(psys->adev->mmu);
++		if (ret) {
++			dev_err(dev, "MMU hw init failed: %d\n", ret);
++			goto rpm_put;
++		}
++		ipu7_psys_setup_hw(psys);
++		ipu7_psys_subdomains_power(psys, 1);
++		ret = ipu7_boot_start_fw(psys->adev);
++		if (ret) {
++			dev_err(dev, "failed to start psys fw: %d\n", ret);
++			goto rpm_put;
++		}
++		ret = ipu7_fw_psys_open(psys);
++		if (ret) {
++			dev_err(dev, "Failed to open abi: %d\n", ret);
++			goto rpm_put;
++		}
++		spin_lock_irqsave(&psys->ready_lock, wk_flags);
++		psys->ready = 1;
++		spin_unlock_irqrestore(&psys->ready_lock, wk_flags);
++	}
++
+ 	list_add_tail(&fh->list, &psys->fhs);
+ 
+ 	mutex_unlock(&psys->mutex);
+@@ -548,6 +575,21 @@ static int ipu7_psys_release(struct inode *inode, struct file *file)
+ 	mutex_lock(&psys->mutex);
+ 	list_del(&fh->list);
+ 
++	/* Workaround: clean up hardware since runtime PM suspend won't fire */
++	if (list_empty(&psys->fhs) && psys->ready) {
++		unsigned long wk_flags;
++
++		dev_info(&psys->adev->auxdev.dev,
++			 "PSYS cleaning up hw (suspend workaround)\n");
++		ipu7_fw_psys_close(psys);
++		ipu7_boot_stop_fw(psys->adev);
++		ipu7_psys_subdomains_power(psys, 0);
++		ipu7_mmu_hw_cleanup(psys->adev->mmu);
++		spin_lock_irqsave(&psys->ready_lock, wk_flags);
++		psys->ready = 0;
++		spin_unlock_irqrestore(&psys->ready_lock, wk_flags);
++	}
++
+ 	ipu7_psys_put_graph_id(fh);
+ 	kfree(fh->ip);
+ 
+diff --git a/include/linux/auxiliary_bus.h b/include/linux/auxiliary_bus.h
+index 4086afd0c..ff7decb03 100644
+--- a/include/linux/auxiliary_bus.h
++++ b/include/linux/auxiliary_bus.h
+@@ -156,7 +156,6 @@ struct auxiliary_device {
+  * @remove: Called when device is removed from the bus.
+  * @shutdown: Called at shut-down time to quiesce the device.
+  * @suspend: Called to put the device to sleep mode. Usually to a power state.
+- * @resume: Called to bring a device from sleep mode.
+  * @name: Driver name.
+  * @driver: Core driver structure.
+  * @id_table: Table of devices this driver should match on the bus.
+@@ -191,7 +190,6 @@ struct auxiliary_driver {
+ 	void (*remove)(struct auxiliary_device *auxdev);
+ 	void (*shutdown)(struct auxiliary_device *auxdev);
+ 	int (*suspend)(struct auxiliary_device *auxdev, pm_message_t state);
+-	int (*resume)(struct auxiliary_device *auxdev);
+ 	const char *name;
+ 	struct device_driver driver;
+ 	const struct auxiliary_device_id *id_table;
+-- 
+2.53.0
+

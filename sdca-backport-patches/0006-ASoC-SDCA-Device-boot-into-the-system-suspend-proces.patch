@@ -1,0 +1,170 @@
+From d863033e3986a2079073d86e5525def230ae90ef Mon Sep 17 00:00:00 2001
+From: Charles Keepax <ckeepax@opensource.cirrus.com>
+Date: Fri, 9 Jan 2026 14:52:05 +0000
+Subject: [PATCH 06/17] ASoC: SDCA: Device boot into the system suspend process
+
+When system suspending the device may be powered off, this means all
+state will be lost and the firmware may need to be re-downloaded. Add
+the necessary calls to bring the device back up. This also requires that
+that the FDL (firmware download) IRQ handler is modified to allow it to
+run before runtime PM has been fully restored.
+
+Signed-off-by: Charles Keepax <ckeepax@opensource.cirrus.com>
+Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.dev>
+Link: https://patch.msgid.link/20260109145206.3456151-4-ckeepax@opensource.cirrus.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ sound/soc/sdca/sdca_class_function.c | 72 +++++++++++++++++++---------
+ sound/soc/sdca/sdca_interrupts.c     | 17 +++++--
+ 2 files changed, 62 insertions(+), 27 deletions(-)
+
+diff --git a/sound/soc/sdca/sdca_class_function.c b/sound/soc/sdca/sdca_class_function.c
+index 7d0a6c0adbfb..bbf486d9a3d0 100644
+--- a/sound/soc/sdca/sdca_class_function.c
++++ b/sound/soc/sdca/sdca_class_function.c
+@@ -211,21 +211,12 @@ static const struct snd_soc_component_driver class_function_component_drv = {
+ 	.endianness		= 1,
+ };
+ 
+-static int class_function_boot(struct class_function_drv *drv)
++static int class_function_init_device(struct class_function_drv *drv,
++				      unsigned int status)
+ {
+-	unsigned int reg = SDW_SDCA_CTL(drv->function->desc->adr,
+-					SDCA_ENTITY_TYPE_ENTITY_0,
+-					SDCA_CTL_ENTITY_0_FUNCTION_STATUS, 0);
+-	unsigned int val;
+ 	int ret;
+ 
+-	ret = regmap_read(drv->regmap, reg, &val);
+-	if (ret < 0) {
+-		dev_err(drv->dev, "failed to read function status: %d\n", ret);
+-		return ret;
+-	}
+-
+-	if (!(val & SDCA_CTL_ENTITY_0_FUNCTION_HAS_BEEN_RESET)) {
++	if (!(status & SDCA_CTL_ENTITY_0_FUNCTION_HAS_BEEN_RESET)) {
+ 		dev_dbg(drv->dev, "reset function device\n");
+ 
+ 		ret = sdca_reset_function(drv->dev, drv->function, drv->regmap);
+@@ -233,24 +224,36 @@ static int class_function_boot(struct class_function_drv *drv)
+ 			return ret;
+ 	}
+ 
+-	if (val & SDCA_CTL_ENTITY_0_FUNCTION_NEEDS_INITIALIZATION) {
++	if (status & SDCA_CTL_ENTITY_0_FUNCTION_NEEDS_INITIALIZATION) {
+ 		dev_dbg(drv->dev, "write initialisation\n");
+ 
+ 		ret = sdca_regmap_write_init(drv->dev, drv->core->dev_regmap,
+ 					     drv->function);
+ 		if (ret)
+ 			return ret;
++	}
+ 
+-		ret = regmap_write(drv->regmap, reg,
+-				   SDCA_CTL_ENTITY_0_FUNCTION_NEEDS_INITIALIZATION);
+-		if (ret < 0) {
+-			dev_err(drv->dev,
+-				"failed to clear function init status: %d\n",
+-				ret);
+-			return ret;
+-		}
++	return 0;
++}
++
++static int class_function_boot(struct class_function_drv *drv)
++{
++	unsigned int reg = SDW_SDCA_CTL(drv->function->desc->adr,
++					SDCA_ENTITY_TYPE_ENTITY_0,
++					SDCA_CTL_ENTITY_0_FUNCTION_STATUS, 0);
++	unsigned int val;
++	int ret;
++
++	ret = regmap_read(drv->regmap, reg, &val);
++	if (ret < 0) {
++		dev_err(drv->dev, "failed to read function status: %d\n", ret);
++		return ret;
+ 	}
+ 
++	ret = class_function_init_device(drv, val);
++	if (ret)
++		return ret;
++
+ 	/* Start FDL process */
+ 	ret = sdca_irq_populate_early(drv->dev, drv->regmap, drv->function,
+ 				      drv->core->irq_info);
+@@ -419,10 +422,35 @@ static int class_function_runtime_resume(struct device *dev)
+ 	regcache_cache_only(drv->regmap, false);
+ 
+ 	if (drv->suspended) {
++		unsigned int reg = SDW_SDCA_CTL(drv->function->desc->adr,
++						SDCA_ENTITY_TYPE_ENTITY_0,
++						SDCA_CTL_ENTITY_0_FUNCTION_STATUS, 0);
++		unsigned int val;
++
++		ret = regmap_read(drv->regmap, reg, &val);
++		if (ret < 0) {
++			dev_err(drv->dev, "failed to read function status: %d\n", ret);
++			goto err;
++		}
++
++		ret = class_function_init_device(drv, val);
++		if (ret)
++			goto err;
++
+ 		sdca_irq_enable_early(drv->function, drv->core->irq_info);
+-		/* TODO: Add FDL process between early and late IRQs */
++
++		ret = sdca_fdl_sync(drv->dev, drv->function, drv->core->irq_info);
++		if (ret)
++			goto err;
++
+ 		sdca_irq_enable(drv->function, drv->core->irq_info);
+ 
++		ret = regmap_write(drv->regmap, reg, 0xFF);
++		if (ret < 0) {
++			dev_err(drv->dev, "failed to clear function status: %d\n", ret);
++			goto err;
++		}
++
+ 		drv->suspended = false;
+ 	}
+ 
+diff --git a/sound/soc/sdca/sdca_interrupts.c b/sound/soc/sdca/sdca_interrupts.c
+index afef7bbf613c..cc40732c30cc 100644
+--- a/sound/soc/sdca/sdca_interrupts.c
++++ b/sound/soc/sdca/sdca_interrupts.c
+@@ -205,10 +205,16 @@ static irqreturn_t fdl_owner_handler(int irq, void *data)
+ 	irqreturn_t irqret = IRQ_NONE;
+ 	int ret;
+ 
+-	ret = pm_runtime_get_sync(dev);
+-	if (ret < 0) {
+-		dev_err(dev, "failed to resume for fdl: %d\n", ret);
+-		goto error;
++	/*
++	 * FDL has to run from the system resume handler, at which point
++	 * we can't wait for the pm runtime.
++	 */
++	if (completion_done(&dev->power.completion)) {
++		ret = pm_runtime_get_sync(dev);
++		if (ret < 0) {
++			dev_err(dev, "failed to resume for fdl: %d\n", ret);
++			goto error;
++		}
+ 	}
+ 
+ 	ret = sdca_fdl_process(interrupt);
+@@ -217,7 +223,8 @@ static irqreturn_t fdl_owner_handler(int irq, void *data)
+ 
+ 	irqret = IRQ_HANDLED;
+ error:
+-	pm_runtime_put(dev);
++	if (completion_done(&dev->power.completion))
++		pm_runtime_put(dev);
+ 	return irqret;
+ }
+ 
+-- 
+2.43.0
+

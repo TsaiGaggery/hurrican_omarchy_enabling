@@ -1,0 +1,18 @@
+#!/bin/bash
+# Wrapper for GNOME Snapshot (Camera) that manages the camera feed on-demand.
+# Starts icamerasrc -> v4l2loopback feed when Camera opens, stops when it closes.
+# This keeps the camera LED off when the Camera app is not in use.
+
+cleanup() {
+    systemctl --user stop camera-feed.service 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+systemctl --user start camera-feed.service
+sleep 2
+
+# Re-scan v4l2loopback so PipeWire picks up the active feed
+systemctl --user restart wireplumber.service
+sleep 1
+
+/usr/bin/snapshot "$@"

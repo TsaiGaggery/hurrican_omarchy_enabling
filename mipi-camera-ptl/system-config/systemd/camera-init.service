@@ -1,0 +1,12 @@
+[Unit]
+Description=Initialize camera (CVS ownership, sensor driver, v4l2loopback)
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c "modprobe intel_cvs && sleep 2 && modprobe ov08x40; CAPS=$$(cat /sys/module/v4l2loopback/parameters/exclusive_caps 2>/dev/null | cut -c1); if [ $$CAPS != Y ]; then rmmod v4l2loopback 2>/dev/null; modprobe v4l2loopback; fi"
+
+[Install]
+WantedBy=multi-user.target

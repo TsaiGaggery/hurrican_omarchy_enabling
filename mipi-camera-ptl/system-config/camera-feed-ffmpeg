@@ -1,0 +1,23 @@
+#!/bin/bash
+# Camera feed: icamerasrc → GStreamer → ffmpeg → v4l2loopback
+#
+# Workaround for GStreamer 1.24's v4l2sink MMAP buffer bug with v4l2loopback.
+# Uses ffmpeg as the V4L2 writer instead of GStreamer's broken v4l2sink.
+
+WIDTH=3840
+HEIGHT=2160
+FPS=30
+DEVICE=/dev/video50
+
+export GST_PLUGIN_PATH=/usr/lib/gstreamer-1.0
+
+exec gst-launch-1.0 -q \
+  icamerasrc device-name=ov08x40-uf sharpness=80 ev=-1 saturation=10 \
+  ! "video/x-raw,format=NV12,width=${WIDTH},height=${HEIGHT},framerate=${FPS}/1" \
+  ! videoflip method=rotate-180 \
+  ! fdsink fd=1 \
+  2>/dev/null \
+| exec ffmpeg -loglevel warning \
+  -f rawvideo -pixel_format nv12 -video_size "${WIDTH}x${HEIGHT}" -framerate "$FPS" \
+  -i pipe:0 \
+  -f v4l2 -pix_fmt nv12 "$DEVICE"

@@ -1,0 +1,11 @@
+[Unit]
+Description=Hardware ISP Camera Feed (icamerasrc -> v4l2loopback)
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+
+[Service]
+Type=simple
+Environment=GST_PLUGIN_PATH=/usr/lib/gstreamer-1.0
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/gst-launch-1.0 icamerasrc device-name=ov08x40-uf sharpness=80 ev=-1 saturation=10 ! video/x-raw,format=NV12,width=3840,height=2160 ! videoflip method=rotate-180 ! videocrop bottom=8 ! videoscale ! video/x-raw,width=3840,height=2160 ! v4l2sink device=/dev/video50
+SuccessExitStatus=SIGTERM SIGKILL 143 137

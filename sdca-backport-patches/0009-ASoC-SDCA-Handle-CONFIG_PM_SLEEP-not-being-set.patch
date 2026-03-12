@@ -1,0 +1,63 @@
+From bd4440ebd20f6a4550c096df22c73116ad1b9925 Mon Sep 17 00:00:00 2001
+From: Charles Keepax <ckeepax@opensource.cirrus.com>
+Date: Thu, 15 Jan 2026 14:11:06 +0000
+Subject: [PATCH 09/17] ASoC: SDCA: Handle CONFIG_PM_SLEEP not being set
+
+If CONFIG_PM_SLEEP is not set the completion used will not exist. Update
+the code to avoid the build error this introduces, without PM_SLEEP it
+should be safe to always run the conditional code.
+
+Fixes: ffd7e8a10111 ("ASoC: SDCA: Device boot into the system suspend process")
+Reported-by: kernel test robot <lkp@intel.com>
+Closes: https://lore.kernel.org/oe-kbuild-all/202601151803.XY7KryHC-lkp@intel.com/
+Signed-off-by: Charles Keepax <ckeepax@opensource.cirrus.com>
+Link: https://patch.msgid.link/20260115141107.564929-1-ckeepax@opensource.cirrus.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+---
+ sound/soc/sdca/sdca_interrupts.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/sound/soc/sdca/sdca_interrupts.c b/sound/soc/sdca/sdca_interrupts.c
+index cc40732c30cc..d9e22cf40f77 100644
+--- a/sound/soc/sdca/sdca_interrupts.c
++++ b/sound/soc/sdca/sdca_interrupts.c
+@@ -198,6 +198,18 @@ static irqreturn_t hid_handler(int irq, void *data)
+ 	return irqret;
+ }
+ 
++#ifdef CONFIG_PM_SLEEP
++static bool no_pm_in_progress(struct device *dev)
++{
++	return completion_done(&dev->power.completion);
++}
++#else
++static bool no_pm_in_progress(struct device *dev)
++{
++	return true;
++}
++#endif
++
+ static irqreturn_t fdl_owner_handler(int irq, void *data)
+ {
+ 	struct sdca_interrupt *interrupt = data;
+@@ -209,7 +221,7 @@ static irqreturn_t fdl_owner_handler(int irq, void *data)
+ 	 * FDL has to run from the system resume handler, at which point
+ 	 * we can't wait for the pm runtime.
+ 	 */
+-	if (completion_done(&dev->power.completion)) {
++	if (no_pm_in_progress(dev)) {
+ 		ret = pm_runtime_get_sync(dev);
+ 		if (ret < 0) {
+ 			dev_err(dev, "failed to resume for fdl: %d\n", ret);
+@@ -223,7 +235,7 @@ static irqreturn_t fdl_owner_handler(int irq, void *data)
+ 
+ 	irqret = IRQ_HANDLED;
+ error:
+-	if (completion_done(&dev->power.completion))
++	if (no_pm_in_progress(dev))
+ 		pm_runtime_put(dev);
+ 	return irqret;
+ }
+-- 
+2.43.0
+

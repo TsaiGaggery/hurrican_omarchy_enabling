@@ -1,0 +1,37 @@
+From d7225adab07857bad156a5b0fdfd30e418b01b5f Mon Sep 17 00:00:00 2001
+From: Intel <intel@localhost>
+Date: Tue, 3 Mar 2026 15:39:55 -0800
+Subject: [PATCH] snapshot: increase video bitrate and improve x264enc quality
+
+- DEFAULT_BITRATE: 2048 -> 12000 kbps (6x higher for 4K video)
+- speed-preset: 4 (faster) -> 6 (medium) for better compression quality
+- tune: left at 4 (zerolatency) to avoid draining buffer pool
+---
+ aperture/src/viewfinder.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/aperture/src/viewfinder.rs b/aperture/src/viewfinder.rs
+index 0cdc0f5..ab88312 100644
+--- a/aperture/src/viewfinder.rs
++++ b/aperture/src/viewfinder.rs
+@@ -16,7 +16,7 @@ use crate::code_detector::QrCodeDetector;
+ ///
+ /// This is the Gstreamer 1.26 default value for x264enc, chosen as reasonable compromise between
+ /// quality and file size. Candidate for a preference.
+-const DEFAULT_BITRATE: u32 = 2048;
++const DEFAULT_BITRATE: u32 = 12000;
+ const PROVIDER_TIMEOUT: u64 = 2;
+ 
+ #[derive(Debug)]
+@@ -915,7 +915,7 @@ impl Viewfinder {
+                     // speed-preset "faster": Lower CPU usage compared to the default "medium" with
+                     //                        minimal reduction of quality, see
+                     //                        https://streaminglearningcenter.com/wp-content/uploads/2019/10/Choosing-an-x264-Preset_1.pdf
+-                    .field("speed-preset", 4)
++                    .field("speed-preset", 6)
+                     .build(),
+             )
+             .item(
+-- 
+2.53.0
+
