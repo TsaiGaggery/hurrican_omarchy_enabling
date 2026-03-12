@@ -820,12 +820,6 @@ YAMLEOF
     fi
     log_info "  Installed libcamera tuning file"
 
-    # Disable VAAPI hardware encoding (vah264enc green line bug)
-    if [[ -n "$REAL_HOME" ]] && command -v runuser &>/dev/null; then
-        run_as_user gsettings set org.gnome.Snapshot enable-hardware-encoding false 2>/dev/null || true
-        log_info "  Disabled hardware encoding in Snapshot (VAAPI workaround)"
-    fi
-
     log_ok "Permissions and workarounds applied"
 
     # ── 2.15 Finalize ──────────────────────────────────────────────

@@ -180,7 +180,4 @@ but if it got deleted: `sudo ln -sf ~/kernel-build/linux-6.19.6 /lib/modules/$(u
 Check `sudo dmesg | grep -i cvs` — you need "Transfer of ownership success".
 If missing, the CVS patch wasn't applied. Also verify firmware is in `/lib/firmware/intel/ipu/`.
 
-**Green line at bottom of video recordings:**
-Hardware encoding (VAAPI) has a bug on this platform. The script disables it
-automatically, but verify: `gsettings get org.gnome.Snapshot enable-hardware-encoding`
-should return `false`.
+
