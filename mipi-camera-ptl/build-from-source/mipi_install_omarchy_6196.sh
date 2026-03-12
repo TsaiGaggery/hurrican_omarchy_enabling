@@ -141,9 +141,13 @@ log_info "Running kernel: $KVER"
 log_info "Kernel source:  $KERNEL_SRC"
 
 # Verify running kernel matches source tree (unless --force)
+# Compare base version only (strip git hash suffix) because applying the PSYS
+# patch later adds a commit, changing the full kernelrelease string.
 if [[ $FORCE -eq 0 ]]; then
     EXPECTED_KVER=$(make -s -C "$KERNEL_SRC" kernelrelease 2>/dev/null || echo "unknown")
-    if [[ "$KVER" != "$EXPECTED_KVER" ]]; then
+    KVER_BASE="${KVER%%-g*}"
+    EXPECTED_BASE="${EXPECTED_KVER%%-g*}"
+    if [[ "$KVER_BASE" != "$EXPECTED_BASE" ]]; then
         log_warn "Running kernel ($KVER) doesn't match kernel source ($EXPECTED_KVER)"
         log_warn "Use --force to skip this check"
         read -rp "Continue anyway? [y/N] " answer
